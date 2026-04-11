@@ -1,0 +1,108 @@
+name: auto-grading
+
+on: [push]
+
+env:
+  CARGO_TERM_COLOR: always
+  rust_toolchain: nightly
+
+jobs:
+  basic-test:
+    name: Basic Test
+    runs-on: ubuntu-latest
+    outputs:
+      basic_points: ${{ steps.basic_points.outputs.basic_points }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+
+      - name: install dependencies
+        run: |
+          sudo apt-get update
+          echo "set man-db/auto-update false" | sudo debconf-communicate
+          sudo dpkg-reconfigure man-db
+          sudo apt-get install -y \
+            wget \
+            xxd \
+            curl \
+            gcc \
+            g++ \
+            make \
+            libclang-dev \
+            qemu-system-misc \
+            bash \
+            sudo \
+            git \
+            dosfstools \
+            build-essential \
+            pkg-config \
+            libssl-dev \
+            libz-dev \
+            libclang-dev
+
+      - uses: arceos-org/setup-musl@v1
+        with:
+          arch: riscv64
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: nightly-2024-09-04
+          components: rust-src, llvm-tools, clippy, rustfmt
+          targets: x86_64-unknown-none, riscv64gc-unknown-none-elf, aarch64-unknown-none, aarch64-unknown-none-softfloat, loongarch64-unknown-none
+
+      - name: Setup binutils wrappers
+        run: |
+          SYSROOT=$(rustc --print sysroot)
+          LLVM_BIN="$SYSROOT/lib/rustlib/x86_64-unknown-linux-gnu/bin"
+          cp "$LLVM_BIN/llvm-objcopy" ~/.cargo/bin/rust-objcopy
+          cp "$LLVM_BIN/llvm-objdump" ~/.cargo/bin/rust-objdump
+
+      - name: Run basic
+        id: basic_points
+        run: |
+          qemu-system-riscv64 --version
+          cargo --version
+
+          ./scripts/total-test.sh | tee tmp.txt
+          score=$(cat tmp.txt | tail -n1)
+
+          cat test.output
+
+          rm tmp.txt test.output -f
+          echo "basic_points=$score" >> $GITHUB_OUTPUT
+
+  deploy:
+    name: Report Score to Server
+    needs: basic-test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Report Score
+        env:
+          basic_score: ${{ needs.basic-test.outputs.basic_points }}
+          total_score: 600
+        run: |
+          echo "Basic: $basic_score"
+
+          score_json=$(jq -n \
+            --arg channel "github" \
+            --arg courseId "${{ secrets.ARCEOS_2026_SPRING_COURSE_ID }}" \
+            --arg name "${{ github.actor }}" \
+            --argjson score "$basic_score" \
+            --argjson totalScore "$total_score" \
+            --arg ext "{}" \
+            '{channel: $channel, courseId: $courseId, name: $name, score: $score, totalScore: $totalScore, ext: $ext}')
+
+          response=$(curl -X POST "${{ secrets.COURSE_POST_API }}" \
+            -H "accept: application/json;charset=utf-8" \
+            -H "Content-Type: application/json" \
+            -H "token: ${{ secrets.ARCEOS_2026_SPRING_TOKEN }}" \
+            -d "$score_json" \
+            -s)
+
+          if echo "$response" | grep -q '"result":1'; then
+            echo "成功：测试数据已发送"
+          else
+            echo "失败：接口返回异常"
+            exit 1
+          fi
