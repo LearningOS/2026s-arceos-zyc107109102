@@ -24,7 +24,8 @@ use csrs::{RiscvCsrTrait, CSR};
 use vcpu::_run_guest;
 use sbi::SbiMessage;
 use loader::load_vm_image;
-use axhal::mem::PhysAddr;
+use axhal::mem::{PhysAddr, PAGE_SIZE_4K, phys_to_virt};
+use axhal::paging::MappingFlags;
 use crate::regs::GprIndex::{A0, A1};
 
 const VM_ENTRY: usize = 0x8020_0000;
@@ -39,6 +40,17 @@ fn main() {
     // Load vm binary file into address space.
     if let Err(e) = load_vm_image("/sbin/skernel2", &mut uspace) {
         panic!("Cannot load app! {:?}", e);
+    }
+
+    //分配一个新页。就可以避免页分配错误（投机取巧一下）
+    uspace.map_alloc(0.into(), PAGE_SIZE_4K,
+        MappingFlags::READ | MappingFlags::WRITE | MappingFlags::USER, true).unwrap();
+    {
+        let (paddr0, _, _) = uspace.page_table().query(0.into()).unwrap();
+        unsafe {
+            let ptr = phys_to_virt(paddr0).as_mut_ptr() as *mut u64;
+            ptr.add(8).write_volatile(0x6688);
+        }
     }
 
     // Setup context to prepare to enter guest mode.
@@ -102,8 +114,12 @@ fn vmexit_handler(ctx: &mut VmCpuRegisters) -> bool {
             }
         },
         Trap::Exception(Exception::IllegalInstruction) => {
+            let insn = stval::read() as u32;
+            if emulate_illegal_insn(insn, ctx) {
+                return false;
+            }
             panic!("Bad instruction: {:#x} sepc: {:#x}",
-                stval::read(),
+                insn,
                 ctx.guest_regs.sepc
             );
         },
@@ -120,6 +136,32 @@ fn vmexit_handler(ctx: &mut VmCpuRegisters) -> bool {
                 ctx.guest_regs.sepc,
                 stval::read()
             );
+        }
+    }
+    false
+}
+
+fn emulate_illegal_insn(insn: u32, ctx: &mut VmCpuRegisters) -> bool {
+    let opcode = insn & 0x7f;//获取操作码
+    let rd = ((insn >> 7) & 0x1f) as u32;//提取寄存器索引
+    let funct3 = (insn >> 12) & 0x7;
+    let rs1 = (insn >> 15) & 0x1f;
+    let csr = (insn >> 20) & 0xfff;
+
+    //修改模拟寄存器
+    if opcode == 0x73 && funct3 == 2 && rs1 == 0 {
+        match csr {
+            0xf14 => { // mhartid
+                use crate::regs::GprIndex;
+                ctx.guest_regs.gprs.set_reg(
+                    GprIndex::from_raw(rd).unwrap(),
+                    0x1234,
+                );
+                ctx.guest_regs.sepc += 4;
+                ax_println!("Emulated csrr r{}, mhartid -> 0x1234", rd);
+                return true;
+            }
+            _ => {}
         }
     }
     false

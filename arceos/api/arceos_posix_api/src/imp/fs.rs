@@ -202,6 +202,13 @@ pub fn sys_getcwd(buf: *mut c_char, size: usize) -> *mut c_char {
     })
 }
 
+/// Read from a file descriptor at a specific offset without changing the file cursor.
+pub fn sys_fread_at(fd: c_int, offset: usize, buf: &mut [u8]) -> LinuxResult<usize> {
+    let f = File::from_fd(fd)?;
+    let inner = f.inner.lock();
+    Ok(inner.read_at(offset as u64, buf)?)
+}
+
 /// Rename `old` to `new`
 /// If new exists, it is first removed.
 ///

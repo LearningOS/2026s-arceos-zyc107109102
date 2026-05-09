@@ -3,11 +3,14 @@
 use core::ffi::{c_void, c_char, c_int};
 use axhal::arch::TrapFrame;
 use axhal::trap::{register_trap_handler, SYSCALL};
+use axhal::mem::{PAGE_SIZE_4K, VirtAddr};
 use axerrno::LinuxError;
 use axtask::current;
 use axtask::TaskExtRef;
 use axhal::paging::MappingFlags;
 use arceos_posix_api as api;
+use memory_addr::VirtAddrRange;
+use alloc::vec;
 
 const SYS_IOCTL: usize = 29;
 const SYS_OPENAT: usize = 56;
@@ -138,9 +141,62 @@ fn sys_mmap(
     prot: i32,
     flags: i32,
     fd: i32,
-    _offset: isize,
+    offset: isize,
 ) -> isize {
-    unimplemented!("no sys_mmap!");
+    let prot_flags = MmapProt::from_bits_truncate(prot);
+    let map_flags = MmapFlags::from_bits_truncate(flags);
+    //对齐
+    if length == 0 {
+        return -LinuxError::EINVAL.code() as isize;
+    }
+    let aligned_len = (length + PAGE_SIZE_4K - 1) & !(PAGE_SIZE_4K - 1);
+    let mapping_flags: MappingFlags = prot_flags.into();
+    let curr = current();
+    let mut aspace = curr.task_ext().aspace.lock();
+    let map_vaddr = if map_flags.contains(MmapFlags::MAP_FIXED) {
+        let vaddr = addr as usize;
+        if (vaddr & (PAGE_SIZE_4K - 1)) != 0 {
+            return -LinuxError::EINVAL.code() as isize;
+        }
+        VirtAddr::from(vaddr)
+    } else {
+        let hint = if addr.is_null() {
+            VirtAddr::from(0x1_0000) // Prefer above the null page
+        } else {
+            VirtAddr::from(addr as usize)
+        };
+        let range = VirtAddrRange::from_start_size(
+            VirtAddr::from(0x1_0000),
+            aspace.end().as_usize() - 0x1_0000,
+        );
+        match aspace.find_free_area(hint, aligned_len, range) {
+            Some(vaddr) => vaddr,
+            None => {
+                ax_println!("mmap: no free area for size {:#x}", aligned_len);
+                return -LinuxError::ENOMEM.code() as isize;
+            }
+        }
+    };
+    //分配
+    if let Err(e) = aspace.map_alloc(map_vaddr, aligned_len, mapping_flags, true) {
+        ax_println!("mmap: map_alloc failed at {:#x}: {:?}", map_vaddr, e);
+        return -LinuxError::ENOMEM.code() as isize;
+    }
+    if !map_flags.contains(MmapFlags::MAP_ANONYMOUS) && fd >= 0 {
+        let file_offset = offset as usize;
+        let mut buf = vec![0u8; aligned_len];
+        match api::sys_fread_at(fd, file_offset, &mut buf) {
+            Ok(n) => {
+                ax_println!("mmap: read {} bytes from fd={} at offset={:#x}", n, fd, file_offset);
+                let write_len = aligned_len.min(n);
+                let _ = aspace.write(map_vaddr, &buf[..write_len]);
+            }
+            Err(e) => {
+                ax_println!("mmap: read_at failed: {:?}", e);
+            }
+        }
+    }
+    map_vaddr.as_usize() as isize
 }
 
 fn sys_openat(dfd: c_int, fname: *const c_char, flags: c_int, mode: api::ctypes::mode_t) -> isize {

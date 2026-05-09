@@ -67,6 +67,17 @@ impl DirNode {
         children.remove(name);
         Ok(())
     }
+    ///
+    fn rename_node(&self, src_name: &str, dst_name: &str) -> VfsResult {
+        if src_name.is_empty() || dst_name.is_empty() {
+            return Err(VfsError::InvalidInput);
+        }
+        //获取子孩子，删除子孩子，然后新建一个新孩子，以实现更新节点。
+        let mut children = self.children.write();
+        let node = children.remove(src_name).ok_or(VfsError::NotFound)?;
+        children.insert(dst_name.into(), node);
+        Ok(())
+    }
 }
 
 impl VfsNodeOps for DirNode {
@@ -165,6 +176,29 @@ impl VfsNodeOps for DirNode {
         }
     }
 
+    fn rename(&self, src_path: &str, dst_path: &str) -> VfsResult {
+        let (src_name, src_rest) = split_path(src_path);
+        if let Some(src_rest) = src_rest {
+            let src_dir = match src_name {
+                "" | "." => self.this.upgrade().ok_or(VfsError::NotFound)?,
+                ".." => self.parent().ok_or(VfsError::NotFound)?,
+                _ => self
+                    .children
+                    .read()
+                    .get(src_name)
+                    .cloned()
+                    .ok_or(VfsError::NotFound)?,
+            };
+            return src_dir.rename(src_rest, dst_path);//递归函数，一直找到目标目录
+        }
+        //改名
+        let dst_name = extract_leaf_name(dst_path);
+        if dst_name.is_empty() {
+            return Err(VfsError::InvalidInput);
+        }
+        self.rename_node(src_name, &dst_name)
+    }
+
     axfs_vfs::impl_vfs_dir_default! {}
 }
 
@@ -173,4 +207,9 @@ fn split_path(path: &str) -> (&str, Option<&str>) {
     trimmed_path.find('/').map_or((trimmed_path, None), |n| {
         (&trimmed_path[..n], Some(&trimmed_path[n + 1..]))
     })
+}
+
+fn extract_leaf_name(path: &str) -> String {
+    let trimmed = path.trim_end_matches('/');
+    trimmed.rsplit('/').next().unwrap_or(trimmed).into()
 }
